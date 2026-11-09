@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/tailscale/ipn"
@@ -54,6 +55,11 @@ func (t *Tailscale) setRunning(ctx context.Context, running bool) (err error) {
 		if err != nil {
 			t.paused.Store(previous)
 			err = errors.Join(err, t.savePaused(previous))
+			if t.serverStarted.Load() {
+				restoreCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				err = errors.Join(err, t.editRunning(restoreCtx, !previous))
+			}
 		}
 	}()
 	if running {
@@ -66,6 +72,10 @@ func (t *Tailscale) setRunning(ctx context.Context, running bool) (err error) {
 	} else if !t.serverStarted.Load() {
 		return nil
 	}
+	return t.editRunning(ctx, running)
+}
+
+func (t *Tailscale) editRunning(ctx context.Context, running bool) error {
 	client, err := t.server.LocalClient()
 	if err != nil {
 		return err
