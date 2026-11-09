@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -49,6 +50,8 @@ type Tailscale struct {
 	backendInitErr  error
 
 	serverStarted atomic.Bool
+	paused        atomic.Bool
+	controlMu     sync.Mutex
 
 	unregisterDNSResolver func()
 }
@@ -146,6 +149,12 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		cancel:        cancel,
 		backendInitCh: make(chan struct{}),
 	}
+	if _, err := os.Stat(outbound.pausePath()); err == nil {
+		outbound.paused.Store(true)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		cancel()
+		return nil, err
+	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	outbound.server = &tsnet.Server{
 		Dir:        option.StateDir,
@@ -186,6 +195,15 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 }
 
 func (t *Tailscale) start() error {
+	t.controlMu.Lock()
+	defer t.controlMu.Unlock()
+	return t.startLocked()
+}
+
+func (t *Tailscale) startLocked() error {
+	if t.paused.Load() {
+		return errors.New("Tailscale is paused")
+	}
 	t.startOnce.Do(func() {
 		if err := t.server.Start(); err != nil {
 			t.startErr = err
@@ -220,6 +238,9 @@ func GetTailscaleStatus(ctx context.Context, proxy C.ProxyAdapter, includeDetail
 				return nil, err
 			}
 		} else if !adapter.serverStarted.Load() {
+			if adapter.paused.Load() {
+				return &ipnstate.Status{BackendState: "Stopped"}, nil
+			}
 			return &ipnstate.Status{BackendState: "NoState"}, nil
 		}
 		client, err := adapter.server.LocalClient()

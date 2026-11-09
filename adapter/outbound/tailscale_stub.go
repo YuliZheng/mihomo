@@ -49,3 +49,7 @@ func PingTailscaleNode(ctx context.Context, proxy C.ProxyAdapter, ip string) (ti
 func LogoutTailscale(ctx context.Context, proxy C.ProxyAdapter) error {
 	return fmt.Errorf("tailscale support is disabled by \"no_tailscale\" build tag or not include \"with_gvisor\" build tag")
 }
+
+func SetTailscaleRunning(ctx context.Context, proxy C.ProxyAdapter, running bool) error {
+	return fmt.Errorf("tailscale support is disabled by build tags")
+}
