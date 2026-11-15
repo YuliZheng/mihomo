@@ -44,8 +44,11 @@ func SetTailscaleRunning(ctx context.Context, proxy C.ProxyAdapter, running bool
 }
 
 func (t *Tailscale) setRunning(ctx context.Context, running bool) (err error) {
-	t.controlMu.Lock()
-	defer t.controlMu.Unlock()
+	unlock := t.lockControl()
+	defer unlock()
+	if err = t.checkOwnershipLocked(); err != nil {
+		return err
+	}
 	previous := t.paused.Load()
 	if err = t.savePaused(!running); err != nil {
 		return err

@@ -52,6 +52,10 @@ type Tailscale struct {
 	serverStarted atomic.Bool
 	paused        atomic.Bool
 	controlMu     sync.Mutex
+	ownership     *tailscaleOwnership
+	generation    uint64
+	closed        bool
+	closeErr      error
 
 	unregisterDNSResolver func()
 }
@@ -156,6 +160,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		return nil, err
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
+	outbound.ownership, outbound.generation = reserveTailscaleOwnership(option.StateDir)
 	outbound.server = &tsnet.Server{
 		Dir:        option.StateDir,
 		Hostname:   option.Hostname,
@@ -195,14 +200,20 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 }
 
 func (t *Tailscale) start() error {
-	t.controlMu.Lock()
-	defer t.controlMu.Unlock()
+	unlock := t.lockControl()
+	defer unlock()
 	return t.startLocked()
 }
 
 func (t *Tailscale) startLocked() error {
+	if err := t.checkOwnershipLocked(); err != nil {
+		return err
+	}
 	if t.paused.Load() {
 		return errors.New("Tailscale is paused")
+	}
+	if err := t.claimOwnershipLocked(); err != nil {
+		return err
 	}
 	t.startOnce.Do(func() {
 		if err := t.server.Start(); err != nil {
@@ -578,6 +589,16 @@ func (t *Tailscale) IsL3Protocol(metadata *C.Metadata) bool {
 }
 
 func (t *Tailscale) Close() error {
+	unlock := t.lockControl()
+	defer unlock()
+	return t.closeLocked()
+}
+
+func (t *Tailscale) closeLocked() error {
+	if t.closed {
+		return t.closeErr
+	}
+	t.closed = true
 	t.cancel()
 	if t.unregisterDNSResolver != nil {
 		t.unregisterDNSResolver()
@@ -586,7 +607,10 @@ func (t *Tailscale) Close() error {
 		t.startErr = errors.New("tailscale outbound closed")
 	})
 	if t.server != nil && t.serverStarted.Load() { // tsnet.Server.Close() must not be called before or concurrently with Start.
-		return t.server.Close()
+		t.closeErr = t.server.Close()
 	}
-	return nil
+	if t.closeErr == nil && t.ownership != nil && t.ownership.active == t {
+		t.ownership.active = nil
+	}
+	return t.closeErr
 }
