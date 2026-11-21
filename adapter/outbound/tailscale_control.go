@@ -14,6 +14,11 @@ import (
 	"github.com/metacubex/tailscale/ipn"
 )
 
+var (
+	tailscaleStartSettleTimeout = 15 * time.Second
+	tailscaleStopSettleTimeout  = 5 * time.Second
+)
+
 func (t *Tailscale) pausePath() string {
 	return filepath.Join(t.option.StateDir, "flclash.paused")
 }
@@ -43,15 +48,29 @@ func SetTailscaleRunning(ctx context.Context, proxy C.ProxyAdapter, running bool
 	}
 }
 
-func (t *Tailscale) setRunning(ctx context.Context, running bool) (err error) {
+func (t *Tailscale) setRunning(ctx context.Context, running bool) error {
+	waitNeeded, err := t.applyRunningIntent(ctx, running)
+	if err != nil || !waitNeeded {
+		return err
+	}
+	// Waiting outside controlMu lets concurrent status polls proceed and keeps settle timeouts from reverting saved user intent.
+	if running {
+		t.settleRunning(ctx)
+	} else {
+		t.settleStopped(ctx)
+	}
+	return nil
+}
+
+func (t *Tailscale) applyRunningIntent(ctx context.Context, running bool) (waitNeeded bool, err error) {
 	unlock := t.lockControl()
 	defer unlock()
 	if err = t.checkOwnershipLocked(); err != nil {
-		return err
+		return false, err
 	}
 	previous := t.paused.Load()
 	if err = t.savePaused(!running); err != nil {
-		return err
+		return false, err
 	}
 	t.paused.Store(!running)
 	defer func() {
@@ -67,15 +86,58 @@ func (t *Tailscale) setRunning(ctx context.Context, running bool) (err error) {
 	}()
 	if running {
 		if err = t.startLocked(); err != nil {
-			return err
+			return false, err
 		}
 		if err = t.waitBackendInitialized(ctx); err != nil {
-			return err
+			return false, err
 		}
 	} else if !t.serverStarted.Load() {
-		return nil
+		return false, nil
 	}
-	return t.editRunning(ctx, running)
+	if err = t.editRunning(ctx, running); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (t *Tailscale) settleRunning(ctx context.Context) {
+	waitCtx, cancel := context.WithTimeout(ctx, tailscaleStartSettleTimeout)
+	defer cancel()
+	for {
+		if t.paused.Load() {
+			return
+		}
+		state, ch := t.snapshotState()
+		switch state {
+		case ipn.Running:
+			if t.hasTailscaleIP() {
+				t.flushDNSCaches()
+				return
+			}
+		case ipn.NeedsLogin, ipn.NeedsMachineAuth:
+			return
+		}
+		if err := t.awaitStateChange(waitCtx, ch); err != nil {
+			return
+		}
+	}
+}
+
+func (t *Tailscale) settleStopped(ctx context.Context) {
+	waitCtx, cancel := context.WithTimeout(ctx, tailscaleStopSettleTimeout)
+	defer cancel()
+	for {
+		if !t.paused.Load() {
+			return
+		}
+		state, ch := t.snapshotState()
+		if state == ipn.Stopped {
+			return
+		}
+		if err := t.awaitStateChange(waitCtx, ch); err != nil {
+			return
+		}
+	}
 }
 
 func (t *Tailscale) editRunning(ctx context.Context, running bool) error {

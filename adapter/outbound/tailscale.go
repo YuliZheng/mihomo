@@ -52,6 +52,11 @@ type Tailscale struct {
 	serverStarted atomic.Bool
 	paused        atomic.Bool
 	controlMu     sync.Mutex
+	stateMu       sync.Mutex
+	backendState  ipn.State
+	stateCondCh   chan struct{}
+	readyFlushed  bool
+	readyCheck    func() bool
 	ownership     *tailscaleOwnership
 	generation    uint64
 	closed        bool
@@ -152,6 +157,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		ctx:           ctx,
 		cancel:        cancel,
 		backendInitCh: make(chan struct{}),
+		stateCondCh:   make(chan struct{}),
 	}
 	if _, err := os.Stat(outbound.pausePath()); err == nil {
 		outbound.paused.Store(true)
@@ -241,6 +247,115 @@ func (t *Tailscale) ensureStarted(ctx context.Context) error {
 	return t.waitBackendInitialized(ctx)
 }
 
+func (t *Tailscale) ensureReady(ctx context.Context) error {
+	if t.isReady() {
+		return nil
+	}
+	if err := t.ensureStarted(ctx); err != nil {
+		return err
+	}
+	return t.waitReady(ctx)
+}
+
+func (t *Tailscale) isReady() bool {
+	if t.paused.Load() || !t.serverStarted.Load() {
+		return false
+	}
+	state, _ := t.snapshotState()
+	return state == ipn.Running && t.hasTailscaleIP()
+}
+
+func (t *Tailscale) waitReady(ctx context.Context) error {
+	for {
+		if t.paused.Load() {
+			return errors.New("Tailscale is paused")
+		}
+		state, ch := t.snapshotState()
+		switch state {
+		case ipn.Running:
+			if t.hasTailscaleIP() {
+				return nil
+			}
+		case ipn.NeedsLogin:
+			return errors.New("Tailscale needs login")
+		case ipn.NeedsMachineAuth:
+			return errors.New("Tailscale needs machine approval")
+		}
+		if err := t.awaitStateChange(ctx, ch); err != nil {
+			return err
+		}
+	}
+}
+
+func (t *Tailscale) awaitStateChange(ctx context.Context, ch <-chan struct{}) error {
+	var done <-chan struct{}
+	if t.ctx != nil {
+		done = t.ctx.Done()
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return t.ctx.Err()
+	}
+}
+
+func (t *Tailscale) snapshotState() (ipn.State, <-chan struct{}) {
+	t.stateMu.Lock()
+	defer t.stateMu.Unlock()
+	if t.stateCondCh == nil {
+		t.stateCondCh = make(chan struct{})
+	}
+	return t.backendState, t.stateCondCh
+}
+
+func (t *Tailscale) notifyStateWaitersLocked() {
+	if t.stateCondCh != nil {
+		close(t.stateCondCh)
+		t.stateCondCh = make(chan struct{})
+	}
+}
+
+func (t *Tailscale) hasTailscaleIP() bool {
+	if t.readyCheck != nil {
+		return t.readyCheck()
+	}
+	if t.server == nil || !t.serverStarted.Load() {
+		return false
+	}
+	v4, v6 := t.server.TailscaleIPs()
+	return v4.IsValid() || v6.IsValid()
+}
+
+func (t *Tailscale) flushDNSCaches() {
+	if t.dnsResolver != nil {
+		t.dnsResolver.ClearCache()
+	}
+	resolver.ClearCache()
+}
+
+func (t *Tailscale) updateBackendState(state *ipn.State, hasNetMap bool) {
+	t.stateMu.Lock()
+	if state != nil {
+		t.backendState = *state
+		if *state != ipn.Running {
+			t.readyFlushed = false
+		}
+	}
+	ready := !t.paused.Load() && t.backendState == ipn.Running && t.hasTailscaleIP()
+	flushDNS := ready && (hasNetMap || !t.readyFlushed)
+	if flushDNS {
+		t.readyFlushed = true
+	}
+	t.notifyStateWaitersLocked()
+	t.stateMu.Unlock()
+	if flushDNS {
+		t.flushDNSCaches()
+	}
+}
+
 func GetTailscaleStatus(ctx context.Context, proxy C.ProxyAdapter, includeDetails bool, activate bool) (*ipnstate.Status, error) {
 	switch adapter := proxy.(type) {
 	case *Tailscale:
@@ -287,7 +402,7 @@ func PingTailscaleNode(ctx context.Context, proxy C.ProxyAdapter, ip string) (ti
 	}
 	switch adapter := proxy.(type) {
 	case *Tailscale:
-		if err = adapter.ensureStarted(ctx); err != nil {
+		if err = adapter.ensureReady(ctx); err != nil {
 			return 0, err
 		}
 		client, clientErr := adapter.server.LocalClient()
@@ -346,8 +461,14 @@ func (t *Tailscale) watchBackendState() {
 		return
 	}
 	defer watcher.Close()
+	defer func() {
+		t.stateMu.Lock()
+		t.notifyStateWaitersLocked()
+		t.stateMu.Unlock()
+	}()
 
 	backendInitialized := false
+	exitNodeApplied := false
 	exitNodeNeedsStatus := tailscaleExitNodeNeedsStatus(t.option)
 	for {
 		n, err := watcher.Next()
@@ -355,22 +476,20 @@ func (t *Tailscale) watchBackendState() {
 			t.setBackendInitialized(err)
 			return
 		}
-		if n.State == nil {
-			continue
-		}
-
-		if *n.State != ipn.NoState && !backendInitialized {
+		if n.State != nil && *n.State != ipn.NoState && !backendInitialized {
 			t.setBackendInitialized(nil)
 			backendInitialized = true
-			if !exitNodeNeedsStatus {
-				return
-			}
 		}
-		if exitNodeNeedsStatus && *n.State == ipn.Running {
-			if err := t.applyExitNodePrefs(t.ctx); err != nil {
-				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
-			}
-			return
+		if n.State != nil || n.NetMap != nil {
+			t.updateBackendState(n.State, n.NetMap != nil)
+		}
+		if exitNodeNeedsStatus && !exitNodeApplied && n.State != nil && *n.State == ipn.Running {
+			exitNodeApplied = true
+			go func() {
+				if err := t.applyExitNodePrefs(t.ctx); err != nil {
+					log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
+				}
+			}()
 		}
 	}
 }
@@ -471,7 +590,7 @@ func tailscaleExitNodeNeedsStatus(option TailscaleOption) bool {
 }
 
 func (t *Tailscale) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	if err = t.ensureStarted(ctx); err != nil {
+	if err = t.ensureReady(ctx); err != nil {
 		return nil, err
 	}
 	netStack, err := t.server.Netstack(ctx)
@@ -508,7 +627,7 @@ func (t *Tailscale) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 }
 
 func (t *Tailscale) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
-	if err = t.ensureStarted(ctx); err != nil {
+	if err = t.ensureReady(ctx); err != nil {
 		return nil, err
 	}
 	if err = t.ResolveUDP(ctx, metadata); err != nil {
@@ -554,7 +673,7 @@ func (t tailscaleDNSTransport) ExchangeContext(ctx context.Context, msg *D.Msg) 
 	if len(msg.Question) == 0 {
 		return nil, errors.New("should have one question at least")
 	}
-	if err := t.tailscale.ensureStarted(ctx); err != nil {
+	if err := t.tailscale.ensureReady(ctx); err != nil {
 		return nil, err
 	}
 	q := msg.Question[0]
@@ -599,7 +718,12 @@ func (t *Tailscale) closeLocked() error {
 		return t.closeErr
 	}
 	t.closed = true
-	t.cancel()
+	if t.cancel != nil {
+		t.cancel()
+	}
+	t.stateMu.Lock()
+	t.notifyStateWaitersLocked()
+	t.stateMu.Unlock()
 	if t.unregisterDNSResolver != nil {
 		t.unregisterDNSResolver()
 	}
